@@ -3,9 +3,11 @@
 ;; Copyright (C) 2011-2021 Free Software Foundation, Inc
 
 ;; Author: Julien Danjou <julien@danjou.info>
+;; Maintainer: emacs-devel@gnu.org
 ;; Version: 0.17
+;; URL: https://elpa.gnu.org/packages/oauth2.html
 ;; Keywords: comm
-;; Package-Requires: ((cl-lib "0.5") (nadvice "0.3"))
+;; Package-Requires: ((emacs "27.1"))
 
 ;; This file is part of GNU Emacs.
 
@@ -27,12 +29,12 @@
 ;; Implementation of the OAuth 2.0 draft.
 ;;
 ;; The main entry point is `oauth2-auth-and-store' which will return a token
-;; structure.  This token structure can be then used with
-;; `oauth2-url-retrieve-synchronously' or `oauth2-url-retrieve' to retrieve
-;; any data that need OAuth authentication to be accessed.
+;; structure, which contains information needed for OAuth2 authentication,
+;; e.g. access_token, refresh_token, etc.
 ;;
-;; If the token needs to be refreshed, the code handles it automatically and
-;; store the new value of the access token.
+;; If the token needs to be refreshed, call `oauth2-refresh-access' on the token
+;; and it will be refreshed with a new access_token.  The code will also store
+;; the new value of the access token for reuse.
 
 ;;; Code:
 
@@ -50,27 +52,82 @@
 (defgroup oauth2 nil
   "OAuth 2.0 Authorization Protocol."
   :group 'comm
-  :link '(url-link :tag "Savannah" "https://git.savannah.gnu.org/cgit/emacs/elpa.git/tree/?h=externals/oauth2")
+  :link '(url-link :tag "Savannah"
+                   "https://git.savannah.gnu.org/cgit/emacs/elpa.git/tree/?h=externals/oauth2")
   :link '(url-link :tag "ELPA" "https://elpa.gnu.org/packages/oauth2.html"))
+
+(defcustom oauth2-token-file (concat user-emacs-directory "oauth2.plstore")
+  "File path where store OAuth tokens."
+  :group 'oauth2
+  :type 'file)
 
 (defvar oauth2-debug nil
   "Enable verbose logging in oauth2 to help debugging.")
 
+(defvar oauth2--url-advice nil)
+(defvar oauth2--token-data)
+
+(defun oauth2--do-warn (&rest msg)
+  "Actual function to log MSG based on how `oauth2-debug' is set."
+  (setcar msg (concat "[oauth2] " (car msg)))
+  (apply (if (functionp oauth2-debug)
+             oauth2-debug
+           'message)
+         msg))
+
+(defun oauth2--do-trivia (&rest msg)
+  "Output debug message when `oauth2-debug' is set to \\='trivia."
+  (when (or (eq oauth2-debug 'trivia)
+            (functionp oauth2-debug))
+    (apply #'oauth2--do-warn msg)))
+
 (defun oauth2--do-debug (&rest msg)
   "Output debug messages when `oauth2-debug' is enabled."
   (when oauth2-debug
-    (setcar msg (concat "[oauth2] " (car msg)))
-    (apply #'message msg)))
+    (apply #'oauth2--do-warn msg)))
 
-(defun oauth2-request-authorization (auth-url client-id &optional scope state redirect-uri)
+(defmacro oauth2--with-plstore (&rest body)
+  "A macro that ensures the plstore is closed after use."
+  `(let ((plstore (plstore-open oauth2-token-file)))
+     (unwind-protect
+         (progn ,@body)
+       (plstore-close plstore))))
+
+(defun oauth2--current-timestamp ()
+  "Get the current timestamp in seconds."
+  (time-convert nil 'integer))
+
+(defun oauth2--update-plstore (plstore token)
+  "Update the file storage with handle PLSTORE with the value in TOKEN."
+  (plstore-put plstore (oauth2-token-plstore-id token)
+               nil `(:access-token
+                     ,(oauth2-token-access-token token)
+                     :refresh-token
+                     ,(oauth2-token-refresh-token token)
+                     :request-timestamp
+                     ,(oauth2-token-request-timestamp token)
+                     :access-response
+                     ,(oauth2-token-access-response token)))
+  (plstore-save plstore))
+
+(defun oauth2-request-authorization (auth-url client-id &optional scope state
+                                              redirect-uri)
   "Request OAuth authorization at AUTH-URL by launching `browse-url'.
-CLIENT-ID is the client id provided by the provider.
-It returns the code provided by the service."
+CLIENT-ID is the client id provided by the provider which uses
+REDIRECT-URI when requesting an access-token.  The default redirect_uri
+for desktop application is usually \"urn:ietf:wg:oauth:2.0:oob\".  SCOPE
+identifies the resources that your application can access on the user's
+behalf.  STATE is a string that your application uses to maintain the
+state between the request and redirect response.
+
+Returns the code provided by the service."
   (let ((url (concat auth-url
                      (if (string-match-p "\?" auth-url) "&" "?")
                      "client_id=" (url-hexify-string client-id)
                      "&response_type=code"
-                     "&redirect_uri=" (url-hexify-string (or redirect-uri "urn:ietf:wg:oauth:2.0:oob"))
+                     "&redirect_uri=" (url-hexify-string
+                                       (or redirect-uri
+                                           "urn:ietf:wg:oauth:2.0:oob"))
                      (if scope (concat "&scope=" (url-hexify-string scope)) "")
                      (if state (concat "&state=" (url-hexify-string state)) "")
                      ;; The following two parameters are required for Gmail
@@ -89,10 +146,10 @@ It returns the code provided by the service."
     (json-read)))
 
 (defun oauth2-make-access-request (url data)
-  "Make an access request to URL using DATA in POST."
-  (let ((func-name (nth 1 (backtrace-frame 3))))
-    (oauth2--do-debug "%s: url: %s" func-name url)
-    (oauth2--do-debug "%s: data: %s" func-name data)
+  "Make an access request to URL using DATA in POST requests."
+  (let ((func-name (nth 1 (backtrace-frame 2))))
+    (oauth2--do-trivia "%s: url: %s" func-name url)
+    (oauth2--do-trivia "%s: data: %s" func-name data)
     (let ((url-request-method "POST")
           (url-request-data data)
           (url-request-extra-headers
@@ -100,7 +157,8 @@ It returns the code provided by the service."
       (with-current-buffer (url-retrieve-synchronously url)
         (let ((data (oauth2-request-access-parse)))
           (kill-buffer (current-buffer))
-          (oauth2--do-debug "%s: response: %s" func-name (prin1-to-string data))
+          (oauth2--do-trivia "%s: response: %s" func-name
+                             (prin1-to-string data))
           data)))))
 
 (cl-defstruct oauth2-token
@@ -110,16 +168,26 @@ It returns the code provided by the service."
   client-secret
   access-token
   refresh-token
+  request-timestamp
+  auth-url
   token-url
   access-response)
 
-(defun oauth2-request-access (token-url client-id client-secret code &optional redirect-uri)
-  "Request OAuth access at TOKEN-URL.
-The CODE should be obtained with `oauth2-request-authorization'.
-Return an `oauth2-token' structure."
+(defun oauth2-request-access (auth-url token-url client-id client-secret code
+                                       &optional redirect-uri)
+  "Request OAuth access.
+TOKEN-URL is the URL for making the request.  CLIENT-ID and
+CLIENT-SECRET are provided by the service provider.  The CODE should be
+obtained with `oauth2-request-authorization'.  REDIRECT-URI is used when
+requesting access-token.  The default value for desktop application is
+usually \"urn:ietf:wg:oauth:2.0:oob\".
+
+Returns an `oauth2-token'."
   (when code
-    (let ((result
+    (let ((request-timestamp (oauth2--current-timestamp))
+          (result
            (oauth2-make-access-request
+            auth-url
             token-url
             (url-encode-url
              (concat
@@ -133,6 +201,8 @@ Return an `oauth2-token' structure."
                          :client-secret client-secret
                          :access-token (cdr (assoc 'access_token result))
                          :refresh-token (cdr (assoc 'refresh_token result))
+                         :request-timestamp request-timestamp
+                         :auth-url auth-url
                          :token-url token-url
                          :access-response result))))
 
@@ -140,33 +210,47 @@ Return an `oauth2-token' structure."
 (defun oauth2-refresh-access (token)
   "Refresh OAuth access TOKEN.
 TOKEN should be obtained with `oauth2-request-access'."
-  (setf (oauth2-token-access-token token)
-        (cdr (assoc 'access_token
-                    (oauth2-make-access-request
-                     (oauth2-token-token-url token)
-                     (concat "client_id=" (oauth2-token-client-id token)
-			     (when (oauth2-token-client-secret token)
-                               (concat "&client_secret=" (oauth2-token-client-secret token)))
-                             "&refresh_token=" (oauth2-token-refresh-token token)
-                             "&grant_type=refresh_token")))))
-  ;; If the token has a plstore, update it
-  (let ((plstore (oauth2-token-plstore token)))
-    (when plstore
-      (plstore-put plstore (oauth2-token-plstore-id token)
-                   nil `(:access-token
-                         ,(oauth2-token-access-token token)
-                         :refresh-token
-                         ,(oauth2-token-refresh-token token)
-                         :access-response
-                         ,(oauth2-token-access-response token)
-                         ))
-      (plstore-save plstore)))
+  (if-let* ((func-name (nth 1 (backtrace-frame 2)))
+            (current-timestamp (oauth2--current-timestamp))
+            (request-timestamp (oauth2-token-request-timestamp token))
+            (timestamp-difference (- current-timestamp request-timestamp))
+            (expires-in (cdr (assoc 'expires_in
+                                    (oauth2-token-access-response token))))
+            (cache-valid
+             (progn
+               (oauth2--do-trivia (concat "%s: current-timestamp: %d, "
+                                          "previous request-timestamp: %d, "
+                                          "timestamp difference: %d; "
+                                          "expires-in: %d, ")
+                                  func-name current-timestamp request-timestamp
+                                  timestamp-difference expires-in)
+               (< timestamp-difference expires-in))))
+      (oauth2--do-debug "%s: reusing cached access-token." func-name)
+
+    (oauth2--do-debug "%s: requesting new access-token." func-name)
+    (setf (oauth2-token-request-timestamp token) current-timestamp)
+    (setf (oauth2-token-access-token token)
+          (cdr (assoc 'access_token
+                      (oauth2-make-access-request
+                       (oauth2-token-token-url token)
+                       (concat "client_id=" (oauth2-token-client-id token)
+                               (when (oauth2-token-client-secret token)
+                                 (concat "&client_secret="
+                                         (oauth2-token-client-secret token)))
+                               "&refresh_token="
+                               (oauth2-token-refresh-token token)
+                               "&grant_type=refresh_token")))))
+    (oauth2--with-plstore
+     (oauth2--update-plstore plstore token)))
+
   token)
 
 ;;;###autoload
-(defun oauth2-auth (auth-url token-url client-id client-secret &optional scope state redirect-uri)
+(defun oauth2-auth (auth-url token-url client-id client-secret
+                             &optional state redirect-uri)
   "Authenticate application via OAuth2."
   (oauth2-request-access
+   auth-url
    token-url
    client-id
    client-secret
@@ -174,112 +258,47 @@ TOKEN should be obtained with `oauth2-request-access'."
     auth-url client-id scope state redirect-uri)
    redirect-uri))
 
-(defcustom oauth2-token-file (concat user-emacs-directory "oauth2.plstore")
-  "File path where store OAuth tokens."
-  :group 'oauth2
-  :type 'file)
-
 (defun oauth2-compute-id (auth-url token-url scope client-id)
-  "Compute an unique id based on URLs.
+  "Compute an unique id based on AUTH-URL, TOKEN-URL, SCOPE, and CLIENT-ID.
 This allows to store the token in an unique way."
   (secure-hash 'sha512 (concat auth-url token-url scope client-id)))
 
 ;;;###autoload
-(defun oauth2-auth-and-store (auth-url token-url scope client-id client-secret &optional redirect-uri state)
-  "Request access to a resource and store it using `plstore'."
+(defun oauth2-auth-and-store (auth-url token-url scope client-id client-secret
+                                       &optional redirect-uri state)
+  "Request access to a resource and store it.
+AUTH-URL and TOKEN-URL are provided by the service provider.  CLIENT-ID
+and CLIENT-SECRET should be generated by the service provider when a
+user registers an application.  SCOPE identifies the resources that your
+application can access on the user's behalf.  STATE is a string that
+your application uses to maintain the state between the request and
+redirect response.
+
+Returns an `oauth2-token'."
   ;; We store a MD5 sum of all URL
-  (let* ((plstore (plstore-open oauth2-token-file))
-         (id (oauth2-compute-id auth-url token-url scope client-id))
-         (plist (cdr (plstore-get plstore id))))
-    ;; Check if we found something matching this access
-    (if plist
-        ;; We did, return the token object
-        (make-oauth2-token :plstore plstore
-                           :plstore-id id
-                           :client-id client-id
-                           :client-secret client-secret
-                           :access-token (plist-get plist :access-token)
-                           :refresh-token (plist-get plist :refresh-token)
-                           :token-url token-url
-                           :access-response (plist-get plist :access-response))
-      (let ((token (oauth2-auth auth-url token-url
-                                client-id client-secret scope state redirect-uri)))
-        ;; Set the plstore
-        (setf (oauth2-token-plstore token) plstore)
-        (setf (oauth2-token-plstore-id token) id)
-        (plstore-put plstore id nil `(:access-token
-                                      ,(oauth2-token-access-token token)
-                                      :refresh-token
-                                      ,(oauth2-token-refresh-token token)
-                                      :access-response
-                                      ,(oauth2-token-access-response token)))
-        (plstore-save plstore)
-        token))))
-
-(defun oauth2-url-append-access-token (token url)
-  "Append access token to URL."
-  (concat url
-          (if (string-match-p "\?" url) "&" "?")
-          "access_token=" (oauth2-token-access-token token)))
-
-(defvar oauth--url-advice nil)
-(defvar oauth--token-data)
-
-(defun oauth2-authz-bearer-header (token)
-  "Return `Authoriztions: Bearer' header with TOKEN."
-  (cons "Authorization" (format "Bearer %s" token)))
-
-(defun oauth2-extra-headers (extra-headers)
-  "Return EXTRA-HEADERS with `Authorization: Bearer' added."
-  (cons (oauth2-authz-bearer-header (oauth2-token-access-token (car oauth--token-data)))
-        extra-headers))
-
-
-;; FIXME: We should change URL so that this can be done without an advice.
-(defun oauth2--url-http-handle-authentication-hack (orig-fun &rest args)
-  (if (not oauth--url-advice)
-      (apply orig-fun args)
-    (let ((url-request-method url-http-method)
-          (url-request-data url-http-data)
-          (url-request-extra-headers
-           (oauth2-extra-headers url-http-extra-headers)))
-      (oauth2-refresh-access (car oauth--token-data))
-      (url-retrieve-internal (cdr oauth--token-data)
-                             url-callback-function
-                             url-callback-arguments)
-      ;; This is to make `url' think it's done.
-      (when (boundp 'success) (setq success t)) ;For URL library in Emacs<24.4.
-      t)))                                      ;For URL library in Emacs≥24.4.
-(advice-add 'url-http-handle-authentication :around
-            #'oauth2--url-http-handle-authentication-hack)
-
-;;;###autoload
-(defun oauth2-url-retrieve-synchronously (token url &optional request-method request-data request-extra-headers)
-  "Retrieve an URL synchronously using TOKEN to access it.
-TOKEN can be obtained with `oauth2-auth'."
-  (let* ((oauth--token-data (cons token url)))
-    (let ((oauth--url-advice t)         ;Activate our advice.
-          (url-request-method request-method)
-          (url-request-data request-data)
-          (url-request-extra-headers
-           (oauth2-extra-headers request-extra-headers)))
-      (url-retrieve-synchronously url))))
-
-;;;###autoload
-(defun oauth2-url-retrieve (token url callback &optional
-                                  cbargs
-                                  request-method request-data request-extra-headers)
-  "Retrieve an URL asynchronously using TOKEN to access it.
-TOKEN can be obtained with `oauth2-auth'.  CALLBACK gets called with CBARGS
-when finished.  See `url-retrieve'."
-  ;; TODO add support for SILENT and INHIBIT-COOKIES.  How to handle this in `url-http-handle-authentication'.
-  (let* ((oauth--token-data (cons token url)))
-    (let ((oauth--url-advice t)         ;Activate our advice.
-          (url-request-method request-method)
-          (url-request-data request-data)
-          (url-request-extra-headers
-           (oauth2-extra-headers request-extra-headers)))
-      (url-retrieve url callback cbargs))))
+  (oauth2--with-plstore
+   (let* ((plstore-id (oauth2-compute-id auth-url token-url scope client-id))
+          (plist (cdr (plstore-get plstore plstore-id))))
+     ;; Check if we found something matching this access
+     (if plist
+         ;; We did, return the token object
+         (make-oauth2-token :plstore-id plstore-id
+                            :client-id client-id
+                            :client-secret client-secret
+                            :access-token (plist-get plist :access-token)
+                            :refresh-token (plist-get plist :refresh-token)
+                            :request-timestamp (plist-get plist
+                                                          :request-timestamp)
+                            :auth-url auth-url
+                            :token-url token-url
+                            :access-response (plist-get plist :access-response))
+       (let ((token (oauth2-auth auth-url token-url
+                                 client-id client-secret state
+                                 redirect-uri)))
+         ;; Set the plstore
+         (setf (oauth2-token-plstore-id token) plstore-id)
+         (oauth2--update-plstore plstore token)
+         token)))))
 
 (provide 'oauth2)
 
