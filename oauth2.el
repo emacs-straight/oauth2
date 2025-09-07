@@ -4,7 +4,7 @@
 
 ;; Author: Julien Danjou <julien@danjou.info>
 ;; Maintainer: Xiyue Deng <manphiz@gmail.com>, emacs-devel@gnu.org
-;; Version: 0.18
+;; Version: 0.18.2
 ;; URL: https://elpa.gnu.org/packages/oauth2.html
 ;; Keywords: comm
 ;; Package-Requires: ((emacs "27.1"))
@@ -39,6 +39,7 @@
 ;;; Code:
 
 (eval-when-compile (require 'cl-lib))
+(require 'org-macs)
 (require 'plstore)
 (require 'json)
 (require 'url-http)
@@ -78,18 +79,18 @@
          msg))
 
 (defun oauth2--do-trivia (&rest msg)
-  "Output debug message when `oauth2-debug' is set to \\='trivia."
+  "Output debug MSG when `oauth2-debug' is set to \\='trivia."
   (when (or (eq oauth2-debug 'trivia)
             (functionp oauth2-debug))
     (apply #'oauth2--do-warn msg)))
 
 (defun oauth2--do-debug (&rest msg)
-  "Output debug messages when `oauth2-debug' is enabled."
+  "Output debug MSG when `oauth2-debug' is enabled."
   (when oauth2-debug
     (apply #'oauth2--do-warn msg)))
 
 (defmacro oauth2--with-plstore (&rest body)
-  "A macro that ensures the plstore is closed after use."
+  "A macro that ensures the plstore is closed after running BODY."
   `(let ((plstore (plstore-open oauth2-token-file)))
      (unwind-protect
          (progn ,@body)
@@ -104,7 +105,7 @@
   "Update REQUEST-CACHE with HOST-NAME and ACCESS-TOKEN.
 The REQUEST-CACHE has the following structure:
 
-((host-name-1 (:access-token access-token-1
+\\=((host-name-1 (:access-token access-token-1
                :request-timestamp request-timestamp-1))
  (host-name-2 (:access-token access-token-2
                :request-timestamp request-timestamp-2))
@@ -131,7 +132,7 @@ Returns the newly updated request-cache."
 (defun oauth2--get-from-request-cache (request-cache host-name slot)
   "Retrieve SLOT info from REQUEST-CACHE of HOST-NAME.
 Returns nil if the slot is unavailable."
-  (plist-get (plist-get request-cache (intern host-name) 'string=) slot))
+  (plist-get (plist-get request-cache (intern host-name)) slot))
 
 (defun oauth2--update-plstore (plstore token)
   "Update the file storage with handle PLSTORE with the value in TOKEN."
@@ -161,9 +162,8 @@ Return a URL-safe string of parameter data."
             (value (pop data)))
         (when (and (stringp value)
                    (not (string-empty-p value)))
-          (add-to-list 'data-list
-                       (concat key "=" (url-hexify-string value))
-                       t))))
+          (push (concat key "=" (url-hexify-string value)) data-list))))
+    (setq data-list (reverse data-list))
     (url-encode-url (string-join data-list "&"))))
 
 (defun oauth2--build-url (address &rest data)
@@ -172,11 +172,10 @@ DATA can be a string or an alist of attributes.  If it is a string, it
 will be encoded; if it is an alist it will be converted to a URL-safe
 string using oauth2--build-url-param-str.  It will then be combined with
 address to build the full URL."
-  (let ((data-str (progn
-                    (if (> (length data) 1)
-                        (apply 'oauth2--build-url-param-str
-                               data)
-                      (url-encode-url (car data))))))
+  (let ((data-str (if (> (length data) 1)
+                      (apply #'oauth2--build-url-param-str
+                             data)
+                    (url-encode-url (car data)))))
     (concat address "?" data-str)))
 
 (defun oauth2--generate-code-verifier (&optional verifier-length)
@@ -184,8 +183,7 @@ address to build the full URL."
 The string should be of length 43 to 128 (inclusive).  If
 VERIFIER-LENGTH is nil, we default to 90 as mutt_oauth2.py did.  See
 RFC7636 for more details."
-  (let* ((func-name "oauth2--generate-code-verifier")
-         (valid-chars
+  (let* ((valid-chars
           "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
          (verifier-length (or verifier-length 90))
          result-list)
@@ -236,7 +234,7 @@ Returns the code provided by the service."
                                           code-verifier)))
                   (setq param (plist-put param
                                          "code_challenge_method" "S256")))
-                (add-to-list 'param auth-url)
+                (push auth-url param)
                 (apply 'oauth2--build-url param))))
     (oauth2--do-trivia "[%s]: url: %s" func-name url)
     (browse-url url)
@@ -282,7 +280,7 @@ Returns the code provided by the service."
 (defun oauth2-request-access (auth-url token-url client-id client-secret code
                                        &optional redirect-uri host-name
                                        code-verifier)
-  "Request OAuth access.
+  "Request OAuth access at AUTH-URL.
 TOKEN-URL is the URL for making the request.  CLIENT-ID and
 CLIENT-SECRET are provided by the service provider.  The CODE should be
 obtained with `oauth2-request-authorization'.  REDIRECT-URI is used when
@@ -325,7 +323,8 @@ Returns an `oauth2-token'."
 ;;;###autoload
 (defun oauth2-refresh-access (token &optional host-name)
   "Refresh OAuth access TOKEN.
-TOKEN should be obtained with `oauth2-request-access'."
+TOKEN should be obtained with `oauth2-request-access'.  HOST-NAME is
+optional but highly recommended which is required for the cache to work."
   (if-let* ((func-name "oauth2-refresh-access")
             (current-timestamp (oauth2--current-timestamp))
             (request-cache (oauth2-token-request-cache token))
@@ -374,7 +373,23 @@ TOKEN should be obtained with `oauth2-request-access'."
 (defun oauth2-auth (auth-url token-url client-id client-secret
                              &optional scope state redirect-uri user-name
                              host-name code-verifier)
-  "Authenticate application via OAuth2."
+  "Authenticate application via OAuth2 at AUTH-URL.
+TOKEN-URL is the URL for making the request.  CLIENT-ID and
+CLIENT-SECRET are provided by the service provider.  SCOPE identifies
+the resources that your application can access on the user's behalf.
+STATE is a string that your application uses to maintain the state
+between the request and redirect response.  REDIRECT-URI is used when
+requesting access-token.  The default value for desktop application is
+usually \"urn:ietf:wg:oauth:2.0:oob\".  USER-NAME is the login user name
+and is required to provide a unique plstore id for users on the same
+service provider.  HOST-NAME is the server to request access, e.g. IMAP
+or SMTP server address.  Its value should match the one when calling
+`oauth2-auth-and-store'.  Leaving HOST-NAME as nil effectively disables
+caching and will request a new token on each request.  CODE-VERIFIER is
+used for the PKCE extension and is required when it was already provided
+during authorization.
+
+Returns an `oauth2-token'."
   (oauth2-request-access
    auth-url
    token-url
@@ -402,7 +417,7 @@ and CLIENT-SECRET should be generated by the service provider when a
 user registers an application.  SCOPE identifies the resources that your
 application can access on the user's behalf.  STATE is a string that
 your application uses to maintain the state between the request and
-redirect response. USER-NAME is the login user name and is required to
+redirect response.  USER-NAME is the login user name and is required to
 provide a unique plstore id for users on the same service provider.
 HOST-NAME is the server to request authentication, e.g. IMAP or SMTP
 server address.  Leaving HOST-NAME as nil effectively disables caching
