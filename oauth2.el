@@ -4,7 +4,7 @@
 
 ;; Author: Julien Danjou <julien@danjou.info>
 ;; Maintainer: Xiyue Deng <manphiz@gmail.com>, emacs-devel@gnu.org
-;; Version: 0.18.3
+;; Version: 0.18.4
 ;; URL: https://elpa.gnu.org/packages/oauth2.html
 ;; Keywords: comm
 ;; Package-Requires: ((emacs "27.1"))
@@ -326,6 +326,8 @@ optional but highly recommended which is required for the cache to work."
   (if-let* ((func-name "oauth2-refresh-access")
             (current-timestamp (oauth2--current-timestamp))
             (request-cache (oauth2-token-request-cache token))
+            (access-token (oauth2--get-from-request-cache
+                           request-cache host-name :access-token))
             (request-timestamp (or (oauth2--get-from-request-cache
                                     request-cache host-name :request-timestamp)
                                    ;; host-name could be nil, so default to 0
