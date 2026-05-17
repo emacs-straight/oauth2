@@ -4,7 +4,7 @@
 
 ;; Author: Julien Danjou <julien@danjou.info>
 ;; Maintainer: Xiyue Deng <manphiz@gmail.com>, emacs-devel@gnu.org
-;; Version: 0.18.4
+;; Version: 0.18.5
 ;; URL: https://elpa.gnu.org/packages/oauth2.html
 ;; Keywords: comm
 ;; Package-Requires: ((emacs "27.1"))
@@ -69,12 +69,31 @@
 
 (defvar oauth2--default-redirect-uri "urn:ietf:wg:oauth:2.0:oob")
 
+(defvar oauth2--log-buffer-name "*oauth2-log*")
+
+(defun oauth2--log (&rest msg)
+  "Log MSG into a dedicated buffer.
+This avoids putting more stuff into *Message*."
+  (with-current-buffer (get-buffer-create oauth2--log-buffer-name)
+    (setq buffer-read-only nil)
+    (let ((follow (= (point) (point-max))))
+      (save-excursion
+        (goto-char (point-max))
+        (insert (apply #'format msg))
+        (insert "\n"))
+      (when follow (goto-char (point-max))))
+    (setq truncate-lines t
+          buffer-read-only t)
+    (set-buffer-modified-p nil)))
+
 (defun oauth2--do-warn (&rest msg)
   "Actual function to log MSG based on how `oauth2-debug' is set."
   (setcar msg (concat "[oauth2] " (car msg)))
   (apply (if (functionp oauth2-debug)
              oauth2-debug
-           'message)
+           (if noninteractive
+               #'message
+             #'oauth2--log))
          msg))
 
 (defun oauth2--do-trivia (&rest msg)
@@ -130,7 +149,9 @@ Returns the newly updated request-cache."
 (defun oauth2--get-from-request-cache (request-cache host-name slot)
   "Retrieve SLOT info from REQUEST-CACHE of HOST-NAME.
 Returns nil if the slot is unavailable."
-  (plist-get (plist-get request-cache (intern host-name)) slot))
+  (let* ((cached-host (plist-get request-cache (intern host-name)))
+         (cached-slot (plist-get cached-host slot)))
+    cached-slot))
 
 (defun oauth2--update-plstore (plstore token)
   "Update the file storage with handle PLSTORE with the value in TOKEN."
@@ -141,6 +162,11 @@ Returns nil if the slot is unavailable."
                      ,(oauth2-token-code-verifier token)
                      :access-response
                      ,(oauth2-token-access-response token)))
+  (plstore-save plstore))
+
+(defun oauth2--delete-plstore (plstore token)
+  "Remove the entry of TOKEN from PLSTORE."
+  (plstore-delete plstore (oauth2-token-plstore-id token))
   (plstore-save plstore))
 
 (defun oauth2--build-url-param-str (&rest data)
@@ -199,6 +225,31 @@ RFC7636 for more details."
                                                    nil nil t))
              0 -1))
 
+(defun oauth2--build-authorization-request-url (auth-url client-id redirect-uri
+                                                         scope state user-name
+                                                         code-verifier)
+  "Build the URL for requesting authorization.
+One should supply all requested parameters: AUTH-URL CLIENT-ID
+REDIRECT-URI SCOPE STATE USER-NAME CODE-VERIFIER."
+  (let ((param `("client_id" ,client-id
+                 "response_type" "code"
+                 "redirect_uri"
+                 ,(or redirect-uri oauth2--default-redirect-uri)
+                 "scope" ,scope
+                 "state" ,state
+                 "login_hint" ,user-name
+                 "access_type" "offline"
+                 "prompt" "consent")))
+    (when (and code-verifier
+               (not (string-empty-p code-verifier)))
+      (setq param (plist-put param "code_challenge"
+                             (oauth2--get-challenge-from-verifier
+                              code-verifier)))
+      (setq param (plist-put param
+                             "code_challenge_method" "S256")))
+    (push auth-url param)
+    (apply 'oauth2--build-url param)))
+
 (defun oauth2-request-authorization (auth-url client-id &optional scope state
                                               redirect-uri user-name
                                               code-verifier)
@@ -216,24 +267,10 @@ code_challenge using method S256 when requesting authorization.
 
 Returns the code provided by the service."
   (let* ((func-name "oauth2-request-authorization")
-         (url (let ((param `("client_id" ,client-id
-                             "response_type" "code"
-                             "redirect_uri"
-                             ,(or redirect-uri oauth2--default-redirect-uri)
-                             "scope" ,scope
-                             "state" ,state
-                             "login_hint" ,user-name
-                             "access_type" "offline"
-                             "prompt" "consent")))
-                (when (and code-verifier
-                           (not (string-empty-p code-verifier)))
-                  (setq param (plist-put param "code_challenge"
-                                         (oauth2--get-challenge-from-verifier
-                                          code-verifier)))
-                  (setq param (plist-put param
-                                         "code_challenge_method" "S256")))
-                (push auth-url param)
-                (apply 'oauth2--build-url param))))
+         (url (oauth2--build-authorization-request-url auth-url client-id
+                                                       redirect-uri scope state
+                                                       user-name
+                                                       code-verifier)))
     (oauth2--do-trivia "[%s]: url: %s" func-name url)
     (browse-url url)
     (read-string (concat "Follow the instruction on your default browser, or "
@@ -261,6 +298,15 @@ Returns the code provided by the service."
           (oauth2--do-trivia "[%s]: response: %s" func-name
                              (prin1-to-string data))
           data)))))
+
+(defun oauth2--request-error (request-result)
+  "Check whether REQUEST-RESULT contain an error."
+  (assoc 'error request-result))
+
+(defun oauth2--request-invalid-grant (request-result)
+  "Check whether the REQUEST-RESULT is an error of invalid_grant."
+  (let* ((error (cdr (assoc 'error request-result))))
+    (and error (string= error "invalid_grant"))))
 
 (cl-defstruct oauth2-token
   plstore
@@ -356,16 +402,30 @@ optional but highly recommended which is required for the cache to work."
                            "client_secret" client-secret
                            "refresh_token" refresh-token
                            "grant_type" "refresh_token"))
-           (access-token (cdr (assoc 'access_token
-                                     (oauth2-make-access-request
-                                      token-url url-param-str))))
+           (request-result (oauth2-make-access-request token-url
+                                                       url-param-str))
+           (access-token (cdr (assoc 'access_token request-result)))
            (request-cache (oauth2-token-request-cache token)))
-      (setf (oauth2-token-access-token token) access-token)
-      (setf (oauth2-token-request-cache token)
-            (oauth2--update-request-cache host-name access-token
-                                          current-timestamp request-cache)))
-    (oauth2--with-plstore
-     (oauth2--update-plstore plstore token)))
+      (cond
+       ((oauth2--request-invalid-grant request-result)
+        (oauth2--do-debug
+         "[%s]: requesting access-token got invalid_grant. Need to re-login."
+         func-name)
+        (oauth2--with-plstore
+         (oauth2--delete-plstore plstore token))
+        (setq token nil))
+       ((oauth2--request-error request-result)
+        (oauth2--do-debug
+         "[%s]: requesting access-token failed. Need to retry."
+         func-name)
+        (setq token nil))
+       (t
+        (setf (oauth2-token-access-token token) access-token)
+        (setf (oauth2-token-request-cache token)
+              (oauth2--update-request-cache host-name access-token
+                                            current-timestamp request-cache))
+        (oauth2--with-plstore
+         (oauth2--update-plstore plstore token))))))
 
   token)
 
