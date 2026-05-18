@@ -4,7 +4,7 @@
 
 ;; Author: Julien Danjou <julien@danjou.info>
 ;; Maintainer: Xiyue Deng <manphiz@gmail.com>, emacs-devel@gnu.org
-;; Version: 0.18.5
+;; Version: 0.18.6
 ;; URL: https://elpa.gnu.org/packages/oauth2.html
 ;; Keywords: comm
 ;; Package-Requires: ((emacs "27.1"))
@@ -407,13 +407,6 @@ optional but highly recommended which is required for the cache to work."
            (access-token (cdr (assoc 'access_token request-result)))
            (request-cache (oauth2-token-request-cache token)))
       (cond
-       ((oauth2--request-invalid-grant request-result)
-        (oauth2--do-debug
-         "[%s]: requesting access-token got invalid_grant. Need to re-login."
-         func-name)
-        (oauth2--with-plstore
-         (oauth2--delete-plstore plstore token))
-        (setq token nil))
        ((oauth2--request-error request-result)
         (oauth2--do-debug
          "[%s]: requesting access-token failed. Need to retry."
