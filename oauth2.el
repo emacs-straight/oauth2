@@ -4,7 +4,7 @@
 
 ;; Author: Julien Danjou <julien@danjou.info>
 ;; Maintainer: Xiyue Deng <manphiz@gmail.com>, emacs-devel@gnu.org
-;; Version: 0.18.6
+;; Version: 0.19.1-git
 ;; URL: https://elpa.gnu.org/packages/oauth2.html
 ;; Keywords: comm
 ;; Package-Requires: ((emacs "27.1"))
@@ -114,6 +114,40 @@ This avoids putting more stuff into *Message*."
          (progn ,@body)
        (plstore-close plstore))))
 
+(defun oauth2--plstore-has-secret-keys (plist)
+  "Return t if PLIST of a plstore entry has secret keys."
+  (string-match-p "\\`:secret-" (symbol-name (car plist))))
+
+(defun oauth2--plstore-safe-delete (plstore name)
+  "Delete the first entry named NAME from PLSTORE.
+This works around an issue with `plstore-delete' that does not decrypt
+the plstore file before deleting and may end up corrupting the plstore
+file.  See also https://debbugs.gnu.org/81061."
+  (when-let* ((entry (assoc name (plstore--get-alist plstore)))
+              (plist (cdr entry)))
+    (when (oauth2--plstore-has-secret-keys plist)
+      (plstore--decrypt plstore)
+      (setq entry (assoc name (plstore--get-alist plstore))))
+    (plstore--set-alist
+     plstore
+     (delq entry (plstore--get-alist plstore))))
+  (when-let* ((entry (assoc name (plstore--get-secret-alist plstore)))
+              (plist (cdr entry)))
+    (when (oauth2--plstore-has-secret-keys plist)
+      (plstore--decrypt plstore)
+      (setq entry (assoc name (plstore--get-secret-alist plstore))))
+    (plstore--set-secret-alist
+     plstore
+     (delq entry (plstore--get-secret-alist plstore))))
+  (when-let* ((entry (assoc name (plstore--get-merged-alist plstore)))
+              (plist (cdr entry)))
+    (when (oauth2--plstore-has-secret-keys plist)
+      (plstore--decrypt plstore)
+      (setq entry (assoc name (plstore--get-merged-alist plstore))))
+    (plstore--set-merged-alist
+     plstore
+     (delq entry (plstore--get-merged-alist plstore)))))
+
 (defun oauth2--current-timestamp ()
   "Get the current timestamp in seconds."
   (time-convert nil 'integer))
@@ -166,7 +200,7 @@ Returns nil if the slot is unavailable."
 
 (defun oauth2--delete-plstore (plstore token)
   "Remove the entry of TOKEN from PLSTORE."
-  (plstore-delete plstore (oauth2-token-plstore-id token))
+  (oauth2--plstore-safe-delete plstore (oauth2-token-plstore-id token))
   (plstore-save plstore))
 
 (defun oauth2--build-url-param-str (&rest data)
@@ -321,6 +355,14 @@ Returns the code provided by the service."
   token-url
   access-response)
 
+(defun oauth2--handle-encoded-code (code)
+  "Handle encoded CODE.
+Microsoft seems to return encoded or double-encoded code, which will
+fail authorization if used directly."
+  (while (string-match-p "%[[:xdigit:]]\\{2\\}" code)
+    (setq code (url-unhex-string code)))
+  code)
+
 (defun oauth2-request-access (auth-url token-url client-id client-secret code
                                        &optional redirect-uri host-name
                                        code-verifier)
@@ -337,32 +379,34 @@ request.  CODE-VERIFIER is used for the PKCE extension and is required
 when it was already provided during authorization.
 
 Returns an `oauth2-token'."
-  (when code
-    (let* ((request-timestamp (oauth2--current-timestamp))
-           (access-response (oauth2-make-access-request
-                             token-url
-                             (oauth2--build-url-param-str
-                              "client_id" client-id
-                              "client_secret" client-secret
-                              "code" code
-                              "code_verifier" code-verifier
-                              "redirect_uri" (or redirect-uri
-                                                 oauth2--default-redirect-uri)
-                              "grant_type" "authorization_code")))
-           (access-token (cdr (assoc 'access_token access-response)))
-           (refresh-token (cdr (assoc 'refresh_token access-response)))
-           (request-cache (oauth2--update-request-cache host-name
-                                                        access-token
-                                                        request-timestamp)))
-      (make-oauth2-token :client-id client-id
-                         :client-secret client-secret
-                         :access-token access-token
-                         :refresh-token refresh-token
-                         :request-cache request-cache
-                         :code-verifier code-verifier
-                         :auth-url auth-url
-                         :token-url token-url
-                         :access-response access-response))))
+  (unless code
+    (error "No valid code"))
+  (let* ((code (oauth2--handle-encoded-code code))
+         (request-timestamp (oauth2--current-timestamp))
+         (access-response (oauth2-make-access-request
+                           token-url
+                           (oauth2--build-url-param-str
+                            "client_id" client-id
+                            "client_secret" client-secret
+                            "code" code
+                            "code_verifier" code-verifier
+                            "redirect_uri" (or redirect-uri
+                                               oauth2--default-redirect-uri)
+                            "grant_type" "authorization_code")))
+         (access-token (cdr (assoc 'access_token access-response)))
+         (refresh-token (cdr (assoc 'refresh_token access-response)))
+         (request-cache (oauth2--update-request-cache host-name
+                                                      access-token
+                                                      request-timestamp)))
+    (make-oauth2-token :client-id client-id
+                       :client-secret client-secret
+                       :access-token access-token
+                       :refresh-token refresh-token
+                       :request-cache request-cache
+                       :code-verifier code-verifier
+                       :auth-url auth-url
+                       :token-url token-url
+                       :access-response access-response)))
 
 ;;;###autoload
 (defun oauth2-refresh-access (token &optional host-name)
@@ -407,6 +451,13 @@ optional but highly recommended which is required for the cache to work."
            (access-token (cdr (assoc 'access_token request-result)))
            (request-cache (oauth2-token-request-cache token)))
       (cond
+       ((oauth2--request-invalid-grant request-result)
+        (oauth2--do-debug
+         "[%s]: requesting access-token got invalid_grant. Need to re-login."
+         func-name)
+        (oauth2--with-plstore
+         (oauth2--delete-plstore plstore token))
+        (setq token nil))
        ((oauth2--request-error request-result)
         (oauth2--do-debug
          "[%s]: requesting access-token failed. Need to retry."
